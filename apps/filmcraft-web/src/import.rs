@@ -156,20 +156,42 @@ pub fn take_files(files: Vec<web_sys::File>) {
 }
 
 /// Files a picker returned: imported, or with a relink hint, the first one is registered under
-/// `/files/<name>` and the hint's command runs on it (#111).
+/// a unique `/files/relink-N/<name>` path and the hint's command runs on it (#111).
 fn picked(files: Vec<web_sys::File>, relink: Option<RelinkHint>) {
     let Some(hint) = relink else { return take_files(files) };
     let Some(f) = files.into_iter().next() else { return };
     wasm_bindgen_futures::spawn_local(async move {
-        let path = fs::register_blob(&f.name(), f.clone().into());
-        crate::recovery::keep_media(&path, &f);
+        let path = fs::register_relink_blob(&f.name(), f.clone().into());
+        // Relinking reads the identity as well as the container index. Fetch only those
+        // ranges, even for multi-gigabyte media; further lazy reads are retried below.
+        let size = f.size() as u64;
+        let span = filmcraft_engine::relink::FINGERPRINT_SPAN as u64;
+        fs::prefetch(&path, 0, size.min(span)).await;
+        fs::prefetch(&path, size.saturating_sub(span), size).await;
+        prewarm(&path, size).await;
         let mut params = hint.params;
         if !params.is_object() {
             params = json!({});
         }
         params["path"] = json!(path);
         let command = hint.command;
-        let outcome = on_ui(move |w, _| w.app.session.execute(&command, params).map_err(|e| e.to_string())).await;
+        let outcome = crate::relink_retry::run(
+            || {
+                let command = command.clone();
+                let params = params.clone();
+                on_ui(move |w, _| {
+                    // Inspect only reads made by this attempt, not another UI operation.
+                    let _ = filmcraft_media::pending::take();
+                    let result = w.app.session.execute(&command, params).map_err(|e| e.to_string());
+                    (result, filmcraft_media::pending::take())
+                })
+            },
+            fs::idle,
+        )
+        .await;
+        if outcome.is_ok() {
+            crate::recovery::keep_media(&path, &f);
+        }
         crate::post(move |w, _| match outcome {
             Ok(v) => {
                 if let Some(n) = v.get("relinked").and_then(Value::as_array).map(Vec::len) {

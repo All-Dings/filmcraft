@@ -143,3 +143,17 @@ cargo xtask web --serve 8765 &
 ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac target/web/dist/web-test.mp4
 node apps/filmcraft-web/tests/smoke.mjs --url http://127.0.0.1:8765/ --media web-test.mp4 --out target/web/smoke
 ```
+
+### Relinking local media
+
+A desktop project's absolute paths do not grant the browser access to its media. Use
+**Link Media → Locate…** to select each missing file. The web host prefetches the file's
+identity ranges and container index, then retries failed relink attempts while Blob reads
+are pending. It does not load a whole large movie or bypass the selected matching checks.
+Relink files use separate virtual directories, preserving the selected basename even if a
+file with that name was already imported or recovered. Successful edits are not retried,
+and recovery keeps media only after the command succeeds. Recovery preserves these
+subdirectories; the existing 4 GiB recovery-copy limit still applies, so larger files must
+be selected again in a new browser session.
+`cargo test -p filmcraft-web --test relink_retry` covers deferred reads, permanent errors,
+exactly-once successful edits and the retry limit.

@@ -74,7 +74,16 @@ fn file_name(path: &str) -> &str {
 /// Register a browser `File` (or named `Blob`) at an unused virtual path; collisions get numbered names.
 /// Name + size do not identify content: replacing an occupied path changes every project item referencing it.
 pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
-    let size = blob.size() as u64;
+    register_blob_path(name, blob, false)
+}
+
+/// A fresh path whose basename is unchanged, so Link Media's file-name check still compares
+/// the selected file's actual name after an earlier import, recovery or failed relink.
+pub fn register_relink_blob(name: &str, blob: web_sys::Blob) -> String {
+    register_blob_path(name, blob, true)
+}
+
+fn register_blob_path(name: &str, blob: web_sys::Blob, preserve_name: bool) -> String {
     let clean: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
     FS.with(|fs| {
         let mut fs = fs.borrow_mut();
@@ -84,18 +93,34 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
         };
         let mut n = 1;
         let path = loop {
-            let p = if n == 1 { format!("/files/{clean}") } else { format!("/files/{stem} ({n}){ext}") };
+            let p = if preserve_name {
+                format!("/files/relink-{n}/{clean}")
+            } else if n == 1 {
+                format!("/files/{clean}")
+            } else {
+                format!("/files/{stem} ({n}){ext}")
+            };
             if !fs.entries.contains_key(&p) {
                 break p;
             }
             n += 1;
         };
-        let id = fs.next_id;
-        fs.next_id += 1;
-        fs.blobs.insert(id, blob);
-        fs.entries.insert(path.clone(), Entry::Blob { id, size });
-        fs.recount();
+        fs.insert_blob(path.clone(), blob);
         path
+    })
+}
+
+/// Restore a relative OPFS media path verbatim, including relink directories. Never replace
+/// an occupied source: a saved project's references must keep pointing at the original bytes.
+pub fn restore_blob(name: &str, blob: web_sys::Blob) -> bool {
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        let path = format!("/files/{name}");
+        if fs.entries.contains_key(&path) {
+            return false;
+        }
+        fs.insert_blob(path, blob);
+        true
     })
 }
 
@@ -182,6 +207,15 @@ pub async fn prefetch(path: &str, a: u64, b: u64) {
 }
 
 impl Fs {
+    fn insert_blob(&mut self, path: String, blob: web_sys::Blob) {
+        let size = blob.size() as u64;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.blobs.insert(id, blob);
+        self.entries.insert(path, Entry::Blob { id, size });
+        self.recount();
+    }
+
     fn recount(&mut self) {
         self.bytes = self.chunks.values().map(|(d, _)| d.len()).sum();
     }

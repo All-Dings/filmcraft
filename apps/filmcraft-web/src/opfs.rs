@@ -130,7 +130,7 @@ pub async fn store_blob(rel: &str, blob: &web_sys::Blob) -> Result<(), JsValue> 
     Ok(())
 }
 
-/// The files in an OPFS directory: (name, File).
+/// The files in an OPFS directory tree: (relative path, File). Traversal is bounded.
 pub async fn files_in(dir_rel: &str) -> Vec<(String, web_sys::File)> {
     let mut out = Vec::new();
     let Ok(dir) = (async {
@@ -144,18 +144,30 @@ pub async fn files_in(dir_rel: &str) -> Vec<(String, web_sys::File)> {
     else {
         return out;
     };
-    let it = dir.values();
-    while let Ok(next) = it.next() {
-        let Ok(r) = JsFuture::from(next).await else { break };
-        let r: js_sys::IteratorNext = r.unchecked_into();
-        if r.done() {
-            break;
-        }
-        let Ok(h) = r.value().dyn_into::<FileSystemFileHandle>() else { continue };
-        if let Ok(f) = JsFuture::from(h.get_file()).await
-            && let Ok(f) = f.dyn_into::<web_sys::File>()
-        {
-            out.push((f.name(), f));
+    let mut dirs = std::collections::VecDeque::from([(String::new(), dir, 0)]);
+    let mut entries = 0;
+    while let Some((prefix, dir, depth)) = dirs.pop_front() {
+        let it = dir.values();
+        while entries < 100_000 {
+            let Ok(next) = it.next() else { break };
+            let Ok(r) = JsFuture::from(next).await else { break };
+            let r: js_sys::IteratorNext = r.unchecked_into();
+            if r.done() {
+                break;
+            }
+            entries += 1;
+            let value = r.value();
+            if let Ok(h) = value.clone().dyn_into::<FileSystemFileHandle>() {
+                if let Ok(f) = JsFuture::from(h.get_file()).await
+                    && let Ok(f) = f.dyn_into::<web_sys::File>()
+                {
+                    out.push((format!("{prefix}{}", f.name()), f));
+                }
+            } else if depth < 8
+                && let Ok(d) = value.dyn_into::<FileSystemDirectoryHandle>()
+            {
+                dirs.push_back((format!("{prefix}{}/", d.name()), d, depth + 1));
+            }
         }
     }
     out

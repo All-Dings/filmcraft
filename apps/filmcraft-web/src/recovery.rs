@@ -3,8 +3,9 @@
 //! - While the project has unsaved changes, a snapshot is written every few seconds to
 //!   `recovery/snapshot.fcproj` with `recovery/meta.json` saying it is dirty; once the project is
 //!   saved (downloaded) the meta is marked clean.
-//! - Imported media are copied to `media/<name>` (the browser streams the copy; nothing goes
-//!   through wasm memory), so the snapshot's `/files/<name>` references resolve after a reload.
+//! - Imported media are copied to `media/<relative path>` (the browser streams the copy;
+//!   nothing goes through wasm memory). Restoring preserves the full `/files/` path, including
+//!   relink directories, so snapshot references still resolve after a reload.
 //! - At start-up a dirty snapshot is reopened (`?norecover` skips it, `?fresh` also skips the media).
 //!   A skipped snapshot stays dirty until this session writes its own ([`crate::recovery_policy`]).
 
@@ -113,9 +114,9 @@ pub fn keep_media(path: &str, file: &web_sys::File) {
 /// Register the media kept in OPFS under their `/files/` paths; returns how many.
 pub async fn restore_media() -> usize {
     let files = opfs::files_in("media").await;
-    let n = files.len();
+    let mut restored = 0;
     for (name, f) in files {
-        crate::fs::register_blob(&name, f.into());
+        restored += usize::from(crate::fs::restore_blob(&name, f.into()));
     }
-    n
+    restored
 }
