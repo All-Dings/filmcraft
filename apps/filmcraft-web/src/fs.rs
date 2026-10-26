@@ -39,7 +39,7 @@ enum Entry {
 #[derive(Default)]
 struct Fs {
     entries: HashMap<String, Entry>,
-    blobs: HashMap<u32, web_sys::Blob>,
+    blobs: HashMap<u32, crate::host_source::Source>,
     next_id: u32,
     chunks: HashMap<(u32, u64), (Arc<[u8]>, u64)>,
     bytes: usize,
@@ -74,7 +74,11 @@ fn file_name(path: &str) -> &str {
 /// Register a browser `File` (or named `Blob`) at an unused virtual path; collisions get numbered names.
 /// Name + size do not identify content: replacing an occupied path changes every project item referencing it.
 pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
-    let size = blob.size() as u64;
+    register_source(name, crate::host_source::Source::Blob(blob))
+}
+
+pub(crate) fn register_source(name: &str, blob: crate::host_source::Source) -> String {
+    let size = blob.size();
     let clean: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
     FS.with(|fs| {
         let mut fs = fs.borrow_mut();
@@ -126,7 +130,7 @@ pub fn blob(path: &str) -> Option<web_sys::Blob> {
     FS.with(|fs| {
         let fs = fs.borrow();
         match fs.entries.get(path)? {
-            Entry::Blob { id, .. } => fs.blobs.get(id).cloned(),
+            Entry::Blob { id, .. } => fs.blobs.get(id).and_then(|source| source.blob()),
             Entry::Mem(b) => bytes_to_blob(b, "application/octet-stream").ok(),
         }
     })
@@ -215,14 +219,10 @@ fn request(id: u32, c: u64) {
         Some(blob)
     });
     let Some(blob) = blob else { return };
-    let size = blob.size() as u64;
+    let size = blob.size();
     let (a, b) = (c * CHUNK, ((c + 1) * CHUNK).min(size));
-    let fut = blob.slice_with_f64_and_f64(a as f64, b as f64).map(|s| JsFuture::from(s.array_buffer()));
     wasm_bindgen_futures::spawn_local(async move {
-        let r = match fut {
-            Ok(f) => f.await.map(|buf| js_sys::Uint8Array::new(&buf).to_vec()),
-            Err(e) => Err(e),
-        };
+        let r = blob.read(a, b).await;
         let wake = FS.with(|fs| {
             let mut fs = fs.borrow_mut();
             fs.inflight.remove(&(id, c));

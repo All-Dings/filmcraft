@@ -143,3 +143,27 @@ cargo xtask web --serve 8765 &
 ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 -f lavfi -i sine -t 3 -c:v libx264 -pix_fmt yuv420p -c:a aac target/web/dist/web-test.mp4
 node apps/filmcraft-web/tests/smoke.mjs --url http://127.0.0.1:8765/ --media web-test.mp4 --out target/web/smoke
 ```
+
+### Media supplied by an embedding host
+
+`filmcraft.provideMedia(source, options)` registers and prewarms a media source.
+`source` is a browser `File`, or `{name, size, read(start, end)}`; offsets are
+absolute bytes and `end` is exclusive. `size` must be a positive safe integer.
+`read` may return a Promise and must return exactly the requested bytes as an
+ArrayBuffer or Uint8Array in the application's JavaScript realm. Reads are at
+most 1 MiB and share the existing bounded LRU, read-ahead and asynchronous retry
+path. The callback must remain available for the lifetime of the open media.
+A callback error or wrong byte count becomes a file-read error.
+
+- `{}` returns `{path}` without adding a project item.
+- `{import:true}` imports into the captured project bin and returns the ordinary
+  `file.import` result (`items`, `errors`).
+- `{item:ID, match:{fileName:false}}` relinks that item to the prepared source.
+  Normal media matching still applies; force, automatic sibling relinks and
+  timecode alignment are disabled. Import/relink abort if the project changed
+  while the source was loading.
+
+Host sources are not copied into OPFS. Their persistent identity, authorization,
+network transport and re-registration after a reload belong to the embedding
+host; the bridge contains no application-specific reference format. Sources
+cannot be exported with `readFile`, which returns registered Blobs/memory files.
