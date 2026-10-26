@@ -212,7 +212,6 @@ pub fn install() -> Result<(), JsValue> {
         })
         .into_js_value(),
     )?;
-    crate::host_media::install(&obj)?;
     let w = web_sys::window().ok_or("no window")?;
     js_sys::Reflect::set(&w, &"filmcraft".into(), &obj)?;
     Ok(())

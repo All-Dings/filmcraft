@@ -1,0 +1,285 @@
+From f6b4a602d5c1a3d715a19676b5334a96476c6422 Mon Sep 17 00:00:00 2001
+From: Michael Holzheu <michael@holzheu.de>
+Date: Mon, 26 Oct 2026 14:12:13 +0100
+Subject: [PATCH] web: Provide bounded media sources from an embedding host
+
+web: Provide bounded media sources from an embedding host
+
+Original-All-Dings-Commit: f6b4a602d5c1a3d715a19676b5334a96476c6422
+
+---
+diff --git a/apps/filmcraft-web/src/api.rs b/apps/filmcraft-web/src/api.rs
+index 6ef52477fcac0fca8e13090dc8d82dda0dd063e4..7da3b5502ebb0faaca54d97551c537dc9cf2a6e1 100644
+--- a/apps/filmcraft-web/src/api.rs
++++ b/apps/filmcraft-web/src/api.rs
+@@ -212,6 +212,7 @@ pub fn install() -> Result<(), JsValue> {
+         })
+         .into_js_value(),
+     )?;
++    crate::host_media::install(&obj)?;
+     let w = web_sys::window().ok_or("no window")?;
+     js_sys::Reflect::set(&w, &"filmcraft".into(), &obj)?;
+     Ok(())
+diff --git a/apps/filmcraft-web/src/fs.rs b/apps/filmcraft-web/src/fs.rs
+index d7ec9072f2efe98e6316dcebf1ef536fe6429835..6723cebf6896e9e335d71ed5ac5df16e9820a239 100644
+--- a/apps/filmcraft-web/src/fs.rs
++++ b/apps/filmcraft-web/src/fs.rs
+@@ -39,7 +39,7 @@ enum Entry {
+ #[derive(Default)]
+ struct Fs {
+     entries: HashMap<String, Entry>,
+-    blobs: HashMap<u32, web_sys::Blob>,
++    blobs: HashMap<u32, crate::host_source::Source>,
+     next_id: u32,
+     chunks: HashMap<(u32, u64), (Arc<[u8]>, u64)>,
+     bytes: usize,
+@@ -74,7 +74,11 @@ fn file_name(path: &str) -> &str {
+ /// Register a browser `File` (or named `Blob`) at an unused virtual path; collisions get numbered names.
+ /// Name + size do not identify content: replacing an occupied path changes every project item referencing it.
+ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
+-    let size = blob.size() as u64;
++    register_source(name, crate::host_source::Source::Blob(blob))
++}
++
++pub(crate) fn register_source(name: &str, blob: crate::host_source::Source) -> String {
++    let size = blob.size();
+     let clean: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+     FS.with(|fs| {
+         let mut fs = fs.borrow_mut();
+@@ -126,7 +130,7 @@ pub fn blob(path: &str) -> Option<web_sys::Blob> {
+     FS.with(|fs| {
+         let fs = fs.borrow();
+         match fs.entries.get(path)? {
+-            Entry::Blob { id, .. } => fs.blobs.get(id).cloned(),
++            Entry::Blob { id, .. } => fs.blobs.get(id).and_then(|source| source.blob()),
+             Entry::Mem(b) => bytes_to_blob(b, "application/octet-stream").ok(),
+         }
+     })
+@@ -215,14 +219,10 @@ fn request(id: u32, c: u64) {
+         Some(blob)
+     });
+     let Some(blob) = blob else { return };
+-    let size = blob.size() as u64;
++    let size = blob.size();
+     let (a, b) = (c * CHUNK, ((c + 1) * CHUNK).min(size));
+-    let fut = blob.slice_with_f64_and_f64(a as f64, b as f64).map(|s| JsFuture::from(s.array_buffer()));
+     wasm_bindgen_futures::spawn_local(async move {
+-        let r = match fut {
+-            Ok(f) => f.await.map(|buf| js_sys::Uint8Array::new(&buf).to_vec()),
+-            Err(e) => Err(e),
+-        };
++        let r = blob.read(a, b).await;
+         let wake = FS.with(|fs| {
+             let mut fs = fs.borrow_mut();
+             fs.inflight.remove(&(id, c));
+diff --git a/apps/filmcraft-web/src/host_media.rs b/apps/filmcraft-web/src/host_media.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..83b0719759eefcaad9ba16a1196774c28ec565d7
+--- /dev/null
++++ b/apps/filmcraft-web/src/host_media.rs
+@@ -0,0 +1,96 @@
++//! Small host bridge: prepare a browser File without adding a project item, or relink one.
++//! No host-specific references, network requests or project format changes.
++use filmcraft_engine::Services;
++use serde_json::{Value, json};
++use wasm_bindgen::prelude::*;
++use wasm_bindgen_futures::future_to_promise;
++
++async fn prepare(file: &JsValue) -> Result<String, JsValue> {
++    use wasm_bindgen::JsCast;
++    let (name, source) = if let Some(blob) = file.dyn_ref::<web_sys::File>() {
++        (blob.name(), crate::host_source::Source::Blob(blob.clone().into()))
++    } else {
++        let name = js_sys::Reflect::get(file, &"name".into())?.as_string().ok_or("Missing media name")?;
++        let size = js_sys::Reflect::get(file, &"size".into())?.as_f64().ok_or("Missing media size")?;
++        if !size.is_finite() || size < 1.0 || size.fract() != 0.0 || size > 9007199254740991.0 {
++            return Err(js_sys::Error::new("Invalid media size").into());
++        }
++        let read = js_sys::Reflect::get(file, &"read".into())?.dyn_into::<js_sys::Function>()?;
++        (name, crate::host_source::Source::Host { size: size as u64, read })
++    };
++    if name.is_empty() || name.len() > 1024 {
++        return Err(js_sys::Error::new("Invalid media name").into());
++    }
++    let size = source.size();
++    let path = crate::fs::register_source(&name, source);
++    let span = filmcraft_engine::relink::FINGERPRINT_SPAN as u64;
++    crate::fs::prefetch(&path, 0, size.min(span)).await;
++    crate::fs::prefetch(&path, size.saturating_sub(span), size).await;
++    crate::import::prewarm(&path, size).await;
++    // Surface rejected/truncated host reads even when only preparing a path.
++    for offset in [0, size.saturating_sub(1)] {
++        crate::fs::WebServices.read_range(&path, offset, 1).map_err(|e| js_sys::Error::new(&e.to_string()))?;
++    }
++    Ok(path)
++}
++
++pub fn install(obj: &js_sys::Object) -> Result<(), JsValue> {
++    let function = Closure::<dyn Fn(JsValue, JsValue) -> js_sys::Promise>::new(|file: JsValue, params: JsValue| {
++        let params = crate::api::from_js(&params);
++        future_to_promise(async move {
++            if !params.is_object() || (params.get("item").is_some() && params.get("item").and_then(Value::as_u64).is_none()) {
++                return Err(js_sys::Error::new("Expected options object with an unsigned item id").into());
++            }
++            let (guard, bin) = crate::import::on_ui(|w, _| {
++                (
++                    w.app.session.execute("project.inspect", json!({})).map(|v| json!([v["path"], v["name"], v["revision"]])).map_err(|e| e.to_string()),
++                    w.app.import_bin().0,
++                )
++            })
++            .await;
++            let guard = guard.map_err(|e| js_sys::Error::new(&e))?;
++            let path = prepare(&file).await?;
++            let importing = params.get("import").and_then(Value::as_bool) == Some(true);
++            if !importing && params.get("item").is_none() {
++                return Ok(crate::api::to_js(&json!({"path": path})));
++            }
++            let mut params = params;
++            let command = if importing {
++                params = json!({"paths":[path], "bin":bin});
++                "file.import"
++            } else {
++                params["path"] = json!(path);
++                // Never remap unrelated items, force a mismatch, or move clip source times.
++                params["relinkOthers"] = json!(false);
++                params["alignTimecode"] = json!(false);
++                params["force"] = json!(false);
++                "media.relink"
++            };
++            for _ in 0..2000 {
++                let p = params.clone();
++                let guard = guard.clone();
++                let (result, pending) = crate::import::on_ui(move |w, _| {
++                    let current = w.app.session.execute("project.inspect", json!({})).map(|v| json!([v["path"], v["name"], v["revision"]]));
++                    if current.ok().as_ref() != Some(&guard) {
++                        return (Err("Project changed while preparing media".to_string()), false);
++                    }
++                    let _ = filmcraft_media::pending::take();
++                    let result = w.app.session.execute(command, p).map_err(|e| e.to_string());
++                    (result, filmcraft_media::pending::take())
++                })
++                .await;
++                if pending && result.as_ref().is_ok_and(|v| v.get("errors").and_then(Value::as_array).is_some_and(|e| !e.is_empty())) {
++                    crate::fs::idle().await;
++                    continue;
++                }
++                match result {
++                    Ok(result) => return Ok(crate::api::to_js(&result)),
++                    Err(_) if pending => crate::fs::idle().await,
++                    Err(error) => return Err(js_sys::Error::new(&error).into()),
++                }
++            }
++            Err(js_sys::Error::new("Timed out loading relink media").into())
++        })
++    });
++    js_sys::Reflect::set(obj, &"provideMedia".into(), &function.into_js_value()).map(|_| ())
++}
+diff --git a/apps/filmcraft-web/src/host_source.rs b/apps/filmcraft-web/src/host_source.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7fa63c1379ec20af47b63b2ee4c11172f24731c
+--- /dev/null
++++ b/apps/filmcraft-web/src/host_source.rs
+@@ -0,0 +1,47 @@
++//! Optional asynchronous range reader supplied by an embedding host.
++use wasm_bindgen::{JsCast, JsValue};
++use wasm_bindgen_futures::JsFuture;
++
++#[derive(Clone)]
++pub enum Source {
++    Blob(web_sys::Blob),
++    Host { size: u64, read: js_sys::Function },
++}
++impl Source {
++    pub fn size(&self) -> u64 {
++        match self {
++            Self::Blob(blob) => blob.size() as u64,
++            Self::Host { size, .. } => *size,
++        }
++    }
++    pub fn blob(&self) -> Option<web_sys::Blob> {
++        match self {
++            Self::Blob(blob) => Some(blob.clone()),
++            Self::Host { .. } => None,
++        }
++    }
++    pub async fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, JsValue> {
++        if start > end || end > self.size() || end - start > crate::fs::CHUNK {
++            return Err(js_sys::Error::new("Invalid host read range").into());
++        }
++        let value = match self {
++            Self::Blob(blob) => JsFuture::from(blob.slice_with_f64_and_f64(start as f64, end as f64)?.array_buffer()).await?,
++            Self::Host { read, .. } => {
++                let result = read.call2(&JsValue::NULL, &JsValue::from_f64(start as f64), &JsValue::from_f64(end as f64))?;
++                JsFuture::from(js_sys::Promise::resolve(&result)).await?
++            }
++        };
++        if !value.is_instance_of::<js_sys::ArrayBuffer>() && !value.is_instance_of::<js_sys::Uint8Array>() {
++            return Err(js_sys::Error::new("Host reader must return ArrayBuffer or Uint8Array").into());
++        }
++        let length = js_sys::Reflect::get(&value, &"byteLength".into())?.as_f64();
++        if length != Some((end - start) as f64) {
++            return Err(js_sys::Error::new("Host reader returned the wrong byte count").into());
++        }
++        let bytes = js_sys::Uint8Array::new(&value);
++        if u64::from(bytes.length()) != end - start {
++            return Err(js_sys::Error::new("Host reader returned the wrong byte count").into());
++        }
++        Ok(bytes.to_vec())
++    }
++}
+diff --git a/apps/filmcraft-web/src/import.rs b/apps/filmcraft-web/src/import.rs
+index a075f9a93f97589cd03707f0987ed9dbf0e3e15f..6b242e95c9912fb76eebf3341ad132aaa1533832 100644
+--- a/apps/filmcraft-web/src/import.rs
++++ b/apps/filmcraft-web/src/import.rs
+@@ -36,7 +36,7 @@ fn be32(b: &[u8]) -> u64 {
+ }
+ 
+ /// Load what opening the file will read first: the container index.
+-async fn prewarm(path: &str, size: u64) {
++pub(crate) async fn prewarm(path: &str, size: u64) {
+     let head_len = size.min(64 << 10);
+     fs::prefetch(path, 0, head_len).await;
+     let Ok(head) = fs::WebServices.read_range(path, 0, head_len as usize) else { return };
+diff --git a/apps/filmcraft-web/src/lib.rs b/apps/filmcraft-web/src/lib.rs
+index 21512ccc54116b15caad5f696c138468efb475dc..2b15b0fbddef451c93bbff3719d9fec9893e1148 100644
+--- a/apps/filmcraft-web/src/lib.rs
++++ b/apps/filmcraft-web/src/lib.rs
+@@ -22,6 +22,8 @@ pub mod api;
+ pub mod audio;
+ pub mod download_pacing;
+ pub mod fs;
++mod host_media;
++mod host_source;
+ pub mod import;
+ pub mod opfs;
+ pub mod recovery;
+diff --git a/docs/all-dings-addons.md b/docs/all-dings-addons.md
+new file mode 100644
+--- /dev/null
++++ b/docs/all-dings-addons.md
+@@ -0,0 +1,25 @@
++# All-Dings Addons
++
++## Media supplied by an embedding host (web.md)
++
++`filmcraft.provideMedia(source, options)` registers and prewarms a media source.
++`source` is a browser `File`, or `{name, size, read(start, end)}`; offsets are
++absolute bytes and `end` is exclusive. `size` must be a positive safe integer.
++`read` may return a Promise and must return exactly the requested bytes as an
++ArrayBuffer or Uint8Array in the application's JavaScript realm. Reads are at
++most 1 MiB and share the existing bounded LRU, read-ahead and asynchronous retry
++path. The callback must remain available for the lifetime of the open media.
++A callback error or wrong byte count becomes a file-read error.
++
++- `{}` returns `{path}` without adding a project item.
++- `{import:true}` imports into the captured project bin and returns the ordinary
++  `file.import` result (`items`, `errors`).
++- `{item:ID, match:{fileName:false}}` relinks that item to the prepared source.
++  Normal media matching still applies; force, automatic sibling relinks and
++  timecode alignment are disabled. Import/relink abort if the project changed
++  while the source was loading.
++
++Host sources are not copied into OPFS. Their persistent identity, authorization,
++network transport and re-registration after a reload belong to the embedding
++host; the bridge contains no application-specific reference format. Sources
++cannot be exported with `readFile`, which returns registered Blobs/memory files.

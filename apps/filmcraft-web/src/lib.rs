@@ -22,8 +22,6 @@ pub mod api;
 pub mod audio;
 pub mod download_pacing;
 pub mod fs;
-mod host_media;
-mod host_source;
 pub mod import;
 pub mod opfs;
 pub mod recovery;
