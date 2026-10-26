@@ -1,6 +1,7 @@
 From: "Codex (GPT-6-Astra)" <noreply@openai.com>
 Date: Mon, 26 Oct 2026 23:11:44 +0100
 Subject: [PATCH] web: Keep WebCodecs enabled after media read errors
+Upstream-PR: https://github.com/storytold/filmcraft/pull/3422
 
 Report source read errors as I/O failures without permanently disabling the
 browser decoder. Pending reads still retry and real decoder errors retain
