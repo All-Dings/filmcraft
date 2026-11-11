@@ -1,2 +1,5 @@
 0001-Provide-media-from-embedding-host.patch
 0002-Keep-WebCodecs-after-media-read-errors.patch
+0003-Provide-temporal-frames-from-embedding-host.patch
+0004-Expose-program-frame-source-reads.patch
+0005-Provide-native-host-frame-sources.patch

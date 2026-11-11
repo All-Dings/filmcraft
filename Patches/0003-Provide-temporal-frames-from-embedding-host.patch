@@ -1,0 +1,488 @@
+--- a/apps/filmcraft-web/src/api.rs
++++ b/apps/filmcraft-web/src/api.rs
+@@ -213,6 +213,7 @@ pub fn install() -> Result<(), JsValue>
+         .into_js_value(),
+     )?;
+     crate::host_media::install(&obj)?;
++    crate::host_frames::install(&obj)?;
+     let w = web_sys::window().ok_or("no window")?;
+     js_sys::Reflect::set(&w, &"filmcraft".into(), &obj)?;
+     Ok(())
+--- /dev/null
++++ b/apps/filmcraft-web/src/host_frames.rs
+@@ -0,0 +1,219 @@
++//! Time-addressed RGBA frames supplied by the embedding host. No domain-specific graph code.
++use filmcraft_frame::{AudioBuffer, VideoFrame};
++use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource, SharedReader, SharedSource};
++use filmcraft_time::Tick;
++use serde_json::json;
++use std::cell::{Cell, RefCell};
++use std::collections::{BTreeMap, HashMap};
++use std::sync::Arc;
++use wasm_bindgen::JsCast;
++use wasm_bindgen::prelude::*;
++use wasm_bindgen_futures::JsFuture;
++
++const MAGIC: &[u8] = b"FilmCraft Host Frames 1\n";
++// Complete host projects can contain up to 64 independently addressed layers.
++const MAX_SOURCES: usize = 64;
++const CACHE_BYTES: usize = 32 * 1024 * 1024;
++struct State {
++    info: MediaInfo,
++    read: js_sys::Function,
++    frames: BTreeMap<i64, Arc<VideoFrame>>,
++    pending: bool,
++    error: Option<String>,
++    reads: u64,
++}
++thread_local! {
++    static SOURCES: RefCell<HashMap<u32, State>> = RefCell::new(HashMap::new());
++    static NEXT: Cell<u32> = const { Cell::new(1) };
++}
++fn error(s: &str) -> JsValue {
++    js_sys::Error::new(s).into()
++}
++fn field(v: &JsValue, key: &str) -> Result<JsValue, JsValue> {
++    js_sys::Reflect::get(v, &key.into())
++}
++
++pub fn install(obj: &js_sys::Object) -> Result<(), JsValue> {
++    filmcraft_codecs::register_reader_opener(open);
++    let provide = Closure::<dyn Fn(JsValue) -> Result<JsValue, JsValue>>::new(|value: JsValue| {
++        let info: MediaInfo = serde_json::from_value(crate::api::from_js(&field(&value, "info")?)).map_err(|e| error(&e.to_string()))?;
++        let video = info.video.as_ref().ok_or_else(|| error("Expected video description"))?;
++        let pixels = u64::from(video.width) * u64::from(video.height);
++        if info.name.is_empty()
++            || info.name.len() > 256
++            || info.duration.0 <= 0
++            || info.duration.0 > 9_007_199_254_740_991
++            || pixels == 0
++            || pixels > 33_554_432
++            || video.width > 8192
++            || video.height > 8192
++            || video.frame_rate.num == 0
++            || video.frame_rate.den == 0
++            || video.frame_rate.num > 120_000
++            || video.frame_rate.den > 10_000
++            || !info.audio_streams.is_empty()
++            || video.pixel_format != "rgba8"
++            || video.par != (1, 1)
++        {
++            return Err(error("Invalid host frame description (RGBA8, <=32M pixels, sides <=8192, positive duration/rate, no audio)"));
++        }
++        let read = field(&value, "read")?.dyn_into::<js_sys::Function>()?;
++        let id = NEXT.with(|n| {
++            let id = n.get();
++            n.set(id.saturating_add(1));
++            id
++        });
++        SOURCES.with(|s| {
++            let mut s = s.borrow_mut();
++            if s.len() >= MAX_SOURCES || id == u32::MAX {
++                return Err(error("Host frame source limit (64) reached; close an existing source first"));
++            }
++            s.insert(id, State { info: info.clone(), read, frames: BTreeMap::new(), pending: false, error: None, reads: 0 });
++            Ok(())
++        })?;
++        let path = format!("/host-frames/{id}.fcframes");
++        let mut bytes = MAGIC.to_vec();
++        bytes.extend_from_slice(id.to_string().as_bytes());
++        crate::fs::put(&path, bytes);
++        Ok(crate::api::to_js(&json!({"path":path, "handle":id})))
++    });
++    js_sys::Reflect::set(obj, &"provideFrames".into(), &provide.into_js_value())?;
++    let close = Closure::<dyn Fn(u32)>::new(|id| {
++        SOURCES.with(|s| {
++            s.borrow_mut().remove(&id);
++        });
++        crate::repaint();
++    });
++    js_sys::Reflect::set(obj, &"closeFrames".into(), &close.into_js_value())?;
++    let stats = Closure::<dyn Fn() -> JsValue>::new(|| {
++        SOURCES.with(|s| {
++            crate::api::to_js(&json!(
++                s.borrow()
++                    .iter()
++                    .map(|(id, s)| json!({"handle":id,"reads":s.reads,"cached":s.frames.len(),"pending":s.pending,"error":s.error}))
++                    .collect::<Vec<_>>()
++            ))
++        })
++    });
++    js_sys::Reflect::set(obj, &"frameSources".into(), &stats.into_js_value())?;
++    Ok(())
++}
++fn open(_name: &str, head: &[u8], _reader: &SharedReader) -> Option<Result<SharedSource, MediaError>> {
++    let suffix = head.strip_prefix(MAGIC)?;
++    let result = || {
++        let id = std::str::from_utf8(suffix).ok().and_then(|s| s.parse::<u32>().ok()).ok_or_else(|| MediaError::Decode("Invalid host frame handle".into()))?;
++        let info = SOURCES
++            .with(|s| s.borrow().get(&id).map(|s| s.info.clone()))
++            .ok_or_else(|| MediaError::Offline("Host frame source is closed; reconnect it in the embedding host".into()))?;
++        Ok(Arc::new(Source { id, info }) as SharedSource)
++    };
++    Some(result())
++}
++struct Source {
++    id: u32,
++    info: MediaInfo,
++}
++impl MediaSource for Source {
++    fn info(&self) -> &MediaInfo {
++        &self.info
++    }
++    fn audio(&self, _: i64, _: usize, _: u32) -> Result<AudioBuffer, MediaError> {
++        Err(MediaError::NoStream("audio"))
++    }
++    fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
++        if req.time.0 < 0 || req.time >= self.info.duration {
++            return Err(MediaError::Decode("Host frame time is outside source duration".into()));
++        }
++        SOURCES.with(|sources| {
++            let mut sources = sources.borrow_mut();
++            let s = sources.get_mut(&self.id).ok_or_else(|| {
++                filmcraft_media::pending::mark();
++                MediaError::Offline("Host frame source closed".into())
++            })?;
++            if let Some(e) = &s.error {
++                // The compositor normally tolerates absent media. Never let an export
++                // commit a placeholder for a failed host frame; the host cancels it.
++                filmcraft_media::pending::mark();
++                return Err(MediaError::Decode(e.clone()));
++            }
++            if let Some(frame) = s.frames.get(&req.time.0) {
++                return Ok(frame.clone());
++            }
++            if !s.pending {
++                s.pending = true;
++                s.reads = s.reads.saturating_add(1);
++                let read = s.read.clone();
++                let id = self.id;
++                let time = req.time.0;
++                let video = s.info.video.as_ref().ok_or(MediaError::NoStream("video"))?;
++                let (w, h) = (video.width, video.height);
++                wasm_bindgen_futures::spawn_local(async move {
++                    let result = fetch(read, time, w, h).await;
++                    SOURCES.with(|sources| {
++                        let mut sources = sources.borrow_mut();
++                        // Removed handles are never reused: late replies cannot affect replacement sources.
++                        if let Some(s) = sources.get_mut(&id) {
++                            s.pending = false;
++                            match result {
++                                Ok(frame) => {
++                                    s.frames.insert(time, Arc::new(frame));
++                                    let limit = (CACHE_BYTES / (w as usize * h as usize * 4)).clamp(1, 64);
++                                    while s.frames.len() > limit {
++                                        let far = s.frames.keys().copied().max_by_key(|t| (i128::from(*t) - i128::from(time)).abs());
++                                        if let Some(t) = far {
++                                            s.frames.remove(&t);
++                                        } else {
++                                            break;
++                                        }
++                                    }
++                                }
++                                Err(e) => {
++                                    let reason =
++                                        e.as_string().or_else(|| field(&e, "message").ok().and_then(|v| v.as_string())).unwrap_or_else(|| format!("{e:?}"));
++                                    let message = format!("Host frame request failed: {reason}");
++                                    log::error!("{message}");
++                                    s.error = Some(message);
++                                }
++                            }
++                        }
++                    });
++                    crate::repaint();
++                });
++            }
++            filmcraft_media::pending::mark();
++            Err(MediaError::Decode("Host frame pending".into()))
++        })
++    }
++}
++async fn fetch(read: js_sys::Function, time: i64, w: u32, h: u32) -> Result<VideoFrame, JsValue> {
++    let request = read.call1(&JsValue::NULL, &time.to_string().into())?;
++    let window = web_sys::window().ok_or_else(|| error("No browser window"))?;
++    let mut callback = None;
++    let mut timer = None;
++    let timeout = js_sys::Promise::new(&mut |_, reject| {
++        let fail = reject.clone();
++        let closure = Closure::once(move || {
++            let _ = fail.call1(&JsValue::NULL, &error("Host frame timeout"));
++        });
++        match window.set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), 15000) {
++            Ok(id) => timer = Some(id),
++            Err(e) => {
++                let _ = reject.call1(&JsValue::NULL, &e);
++            }
++        }
++        callback = Some(closure);
++    });
++    let promises = js_sys::Array::new();
++    promises.push(&js_sys::Promise::resolve(&request));
++    promises.push(&timeout);
++    let result = JsFuture::from(js_sys::Promise::race(&promises)).await;
++    if let Some(timer) = timer {
++        window.clear_timeout_with_handle(timer);
++    }
++    drop(callback);
++    let result = result?;
++    if !result.is_instance_of::<js_sys::Uint8Array>() || field(&result, "byteLength")?.as_f64() != Some(f64::from(w) * f64::from(h) * 4.0) {
++        return Err(error("Host frame must be an exact width*height*4 Uint8Array (straight RGBA8)"));
++    }
++    Ok(VideoFrame::rgba8(w, h, js_sys::Uint8Array::new(&result).to_vec()).with_pts(Tick(time)))
++}
+--- a/apps/filmcraft-web/src/lib.rs
++++ b/apps/filmcraft-web/src/lib.rs
+@@ -22,6 +22,7 @@ pub mod api;
+ pub mod audio;
+ pub mod download_pacing;
+ pub mod fs;
++mod host_frames;
+ mod host_media;
+ mod host_source;
+ pub mod import;
+--- a/docs/all-dings-addons.md
++++ b/docs/all-dings-addons.md
+@@ -23,3 +23,40 @@ Host sources are not copied into OPFS. T
+ network transport and re-registration after a reload belong to the embedding
+ host; the bridge contains no application-specific reference format. Sources
+ cannot be exported with `readFile`, which returns registered Blobs/memory files.
++
++## Temporal frames supplied by an embedding host
++
++`filmcraft.provideFrames({info, read})` returns `{path, handle}`. The host uses
++that virtual file path in an ordinary media project item. `info` is MediaInfo
++for a positive-duration RGBA8 video without audio, at most 33,554,432 pixels and 8192 per side.
++`read(ticks)` receives source time as an exact decimal integer string
++(254016000000 ticks per second) and returns a Promise of straight RGBA8 bytes
++in a Uint8Array from the FilmCraft window's realm. Each response must contain
++exactly width * height * 4 bytes. Alpha is preserved.
++
++The source uses the existing asynchronous media pending/retry mechanism for
++preview and export. It permits one outstanding read per source, 64 sources,
++and a 32 MiB / 64-frame cache per source (at least one frame). Reads expire after 15 seconds.
++`frameSources()` reports handles, read counts, cache sizes and latched errors.
++`closeFrames(handle)` releases the callback and cache; late replies are ignored.
++The host owns persistent bindings, authorization and reconnection after reload.
++Virtual paths and handles alone cannot restore a saved source.
++
++During web playback, an unfinished asynchronous composite remains queued until
++all its layers are ready. The next request then catches up to the playback clock;
++completed pictures can be displayed even when more than six frames late. Layers
++still use the same exact source time. Stop requests the exact playhead picture;
++view, revision and draft changes discard incompatible pending work. This avoids
++starvation under source latency, but does not guarantee real-time frame rates.
++`apps/filmcraft-web/tests/host-frame-playback.html` exercises the 64-source limit and ten synthetic
++sources (one delayed by 600 ms), forward/reverse playback, Stop and seeks.
++
++On a failed read, incomplete frames remain pending, including during export,
++so the compositor cannot silently export its missing-media placeholder. The
++embedding host must surface `frameSources().error`, cancel affected exports
++through `jobs.cancel`, and reconnect the source. ArtCraft performs this check.
++The host must not close sources still used by an active export.
++
++All-Dings keeps Channel graphs, RCZ decoding, canonical measurement time and
++PNG decoding in its adapter. FilmCraft only sees its ordinary media interface;
++its project schema, timeline and compositor are unchanged.
+--- a/crates/ui-egui/src/frames.rs
++++ b/crates/ui-egui/src/frames.rs
+@@ -69,6 +69,10 @@ pub struct FrameKey {
+     pub draft: bool,
+ }
+ 
++fn same_view(a: FrameKey, b: FrameKey) -> bool {
++    a.target == b.target && a.size == b.size && a.revision == b.revision && a.draft == b.draft
++}
++
+ /// Whether a monitor frame is requested with draft decoding ([`FrameKey::draft`]): only while
+ /// playing, at 1/2 resolution or lower, with the preference on.
+ pub fn draft_playback(playing: bool, scale: f32, enabled: bool) -> bool {
+@@ -630,6 +634,29 @@ impl FrameServer {
+     /// not be ready in time are not started and the workers get evenly spaced frames they can
+     /// finish ([`playback_plan`]). While `preroll` (clock not started yet) every frame is wanted.
+     pub fn schedule_playback(&self, key: FrameKey, rate: filmcraft_time::FrameRate, scale: f32, project: &Arc<Project>, speed: f64, preroll: bool) {
++        if cfg!(target_arch = "wasm32") {
++            // Async sources return Pending to pump(), then complete on a later
++            // browser turn. Replacing that job every clock tick starves the
++            // composite forever. Finish one coherent picture, then catch up.
++            let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
++            let pending = q.iter().find(|j| j.prio == 0 && same_view(j.key, key)).map(|j| j.key);
++            q.retain(|j| j.key.target != key.target || Some(j.key) == pending);
++            drop(q);
++            if pending.is_none() {
++                let next = if preroll {
++                    let step = (speed.abs().max(1.0) as i64) * if speed < 0.0 { -1 } else { 1 };
++                    (0..PREROLL_FRAMES)
++                        .map(|i| FrameKey { frame: key.frame.saturating_add(i.saturating_mul(step)), ..key })
++                        .find(|k| k.frame >= 0 && !self.is_ready(k))
++                } else {
++                    Some(key)
++                };
++                if let Some(next) = next {
++                    self.request_job(next, rate.tick_of(next.frame), scale, project, 0, true, None);
++                }
++            }
++            return;
++        }
+         let dir = if speed < 0.0 { -1 } else { 1 };
+         let step = speed.abs().max(1.0) as i64;
+         let fps = rate.as_f64() * speed.abs().max(1.0) / step as f64;
+@@ -666,6 +693,19 @@ impl FrameServer {
+         *self.shared.render_cost.lock().unwrap_or_else(|e| e.into_inner())
+     }
+ 
++    /// Latest completed coherent picture in the playback direction, even when
++    /// an asynchronous source takes longer than the usual six-frame tolerance.
++    /// Never borrow pixels from another view, revision or draft mode.
++    pub fn async_playback_picture(&self, key: FrameKey, speed: f64) -> Option<FrameKey> {
++        let keys: Vec<_> = match key.target {
++            Target::SequencePlan(_) => self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied().collect(),
++            _ => self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied().collect(),
++        };
++        keys.into_iter()
++            .filter(|k| same_view(*k, key) && if speed < 0.0 { k.frame >= key.frame } else { k.frame <= key.frame })
++            .min_by_key(|k| (i128::from(k.frame) - i128::from(key.frame)).abs())
++    }
++
+     /// Drop queued jobs that fail `keep` (e.g. stale revisions or frames far from the playhead).
+     /// Jobs already running for such frames are cancelled: a worker blocked behind a decoder
+     /// would otherwise go on to decode a frame playback has passed, possibly from its keyframe.
+--- a/crates/ui-egui/src/panels/monitor.rs
++++ b/crates/ui-egui/src/panels/monitor.rs
+@@ -216,7 +216,13 @@ pub fn show(app: &mut FilmcraftApp, ui:
+         } else {
+             app.frames.request(key, rate.tick_of(frame), scale, &project, 0);
+         }
+-        let asked = asked_before(app, prefix, key, playing);
++        let mut asked = asked_before(app, prefix, key, playing);
++        if cfg!(target_arch = "wasm32") && playing {
++            let speed = if which == Which::Program { app.playback.speed } else { app.source_playback.clock.speed };
++            if let Some(ready) = app.frames.async_playback_picture(key, speed) {
++                asked.push(ready);
++            }
++        }
+         let tex_name = if channel {
+             format!("monitor-{prefix}-{display:?}")
+         } else if grid {
+--- /dev/null
++++ b/apps/filmcraft-web/tests/host-frame-playback.html
+@@ -0,0 +1,26 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>Asynchronous host playback regression</title>
++<!-- Serve this directory on the same origin as the built app. Pass ?app=/filmcraft/index.html. -->
++<button id="run">Test delayed host playback</button>
++<pre id="result" role="status">Ready</pre>
++<iframe id="app" title="Isolated FilmCraft test" style="width:100%;height:700px;border:0"></iframe>
++<script type="module">
++import {runHostPlaybackTest} from './host-frame-playback.mjs';
++const frame=document.querySelector('#app'), result=document.querySelector('#result'), button=document.querySelector('#run');
++frame.src=(new URLSearchParams(location.search).get('app') || 'index.html')+'?empty&norecover';
++button.onclick=async()=>{
++    button.disabled=true;
++    try {
++        result.textContent='Testing forward playback, Stop, seek and reverse playback…';
++        const deadline=Date.now()+60000;
++        while(!frame.contentWindow.filmcraftLoad?.readyMs) {
++            if(Date.now()>deadline) throw new Error('App did not load');
++            await new Promise(resolve=>setTimeout(resolve,100));
++        }
++        window.HOST_FRAME_TEST_RESULT=await runHostPlaybackTest(frame.contentWindow);
++    } catch(error) { window.HOST_FRAME_TEST_RESULT={ok:false,error:String(error)}; }
++    result.textContent=JSON.stringify(window.HOST_FRAME_TEST_RESULT,null,2);
++    button.disabled=false;
++};
++</script>
+--- /dev/null
++++ b/apps/filmcraft-web/tests/host-frame-playback.mjs
+@@ -0,0 +1,91 @@
++// Synthetic asynchronous sources: no media files or embedding adapter required.
++export async function runHostPlaybackTest(win = window) {
++    const api = win.filmcraft, wait = ms => new Promise(resolve => setTimeout(resolve, ms));
++    const check = (ok, message) => { if (!ok) throw new Error(message); };
++    const info = {name:'Delayed', kind:'Movie', duration:30*254016000000,
++        video:{width:160,height:90,frame_rate:{num:30,den:1},par:[1,1],codec:'host-rgba',pixel_format:'rgba8',
++            color:{matrix:'Bt709',transfer:'Srgb',primaries:'Bt709',range:'Full'},has_alpha:true,bitrate:null},
++        audio_streams:[],container:'host-frames',start_timecode:null,file_size:null};
++    // Two laps with a video, track, two speedometers and a plot need ten sources.
++    const capacity = [];
++    try {
++        for (let i=0;i<64;i++) capacity.push(api.provideFrames({info,read:()=>new win.Uint8Array(160*90*4)}));
++        check(api.frameSources().length===64, '64 sources were not registered');
++        let rejected=false;
++        try { api.provideFrames({info,read:()=>new win.Uint8Array(160*90*4)}); } catch(error) {
++            rejected=String(error).includes('limit (64)');
++        }
++        check(rejected && api.frameSources().length===64, 'Source 65 must fail without changing registered sources');
++    } finally {
++        capacity.forEach(source=>api.closeFrames(source.handle));
++    }
++    check(api.frameSources().length===0, 'Closing sources did not release capacity');
++    const sources = [600,...Array(9).fill(30)].map((delay, index) => api.provideFrames({info, read:async ticks => {
++        await wait(delay);
++        const pixels = new win.Uint8Array(160*90*4);
++        const value = Number(BigInt(ticks)/8467200000n)%255;
++        for (let p=0;p<pixels.length;p+=4) pixels.set([value,index*60,100,128],p);
++        return pixels;
++    }}));
++    const project = {format:'filmcraft.project',schema_version:15,generator:'Host playback regression',project:{
++        name:'Delayed layers',settings:{renderer:'FilmCraft GPU Acceleration (wgpu)',video_display:'Timecode',audio_display_samples:true,
++            default_still_duration:1270080000000,default_transition_duration_frames:24,default_audio_transition_duration:254016000000},
++        root:{id:0,name:'Delayed layers',children:[{Item:1}]},next_id:32,notes:'Synthetic regression',items:{
++            '1':{id:1,name:'Delayed layers',label:'Forest',created:1,metadata:{},kind:{Sequence:{
++                settings:{width:160,height:90,frame_rate:info.video.frame_rate,par:[1,1],sample_rate:48000,drop_frame:false,preset:'Custom',
++                    audio_master:'Stereo',preview_codec:'ProRes 422',max_bit_depth:false,max_render_quality:false,working_space:'Rec. 709'},
++                video_tracks:[],audio_tracks:[],markers:[],mark_in:null,mark_out:null,work_area:null,start_timecode:0}}}}},
++        view:{open_sequences:[1],active_sequence:1,sequences:{}}};
++    sources.forEach((source,index) => {
++        const id=2+index*3;
++        project.project.root.children.push({Item:id});
++        project.project.items[id]={id,name:'Layer '+index,label:'Iris',created:id,metadata:{},kind:{Media:{
++            media:{File:{path:source.path}},info,interpret:{frame_rate:null,par:null,ignore_alpha:false,invert_alpha:false},
++            mark_in:null,mark_out:null,markers:[],offline:false,proxy:null}}};
++        project.project.items['1'].kind.Sequence.video_tracks.push({id:id+1,kind:'Video',name:'Layer '+index,
++            items:[{id:id+2,item:id,name:'Layer '+index,label:'Iris',start:0,duration:info.duration,source_in:0,
++                speed:1,reverse:false,enabled:true,effects:[],frame_hold:null,scale_to_frame:false}],
++            transitions:[],locked:false,sync_lock:true,enabled:true,muted:false,solo:false,channels:'Stereo',volume_db:0,pan:0});
++    });
++    const samples = async (speed) => {
++        await api.request('ui.playback',{action:'play',speed});
++        const frames=[];
++        for (let i=0;i<10;i++) {
++            await wait(700);
++            const stats=await api.execute('perf.stats',{});
++            check(stats.playback.playing, 'Playback stopped unexpectedly');
++            frames.push(stats.monitor.frame);
++        }
++        check(new Set(frames).size>=4, 'Pending source starved playback: '+frames);
++        check(frames.slice(1).every((f,i)=>speed>0?f>=frames[i]:f<=frames[i]), 'Displayed frames reversed direction: '+frames);
++        await api.request('ui.playback',{action:'stop'});
++        return frames;
++    };
++    const exact = async (frame) => {
++        const deadline=Date.now()+5000;
++        while(Date.now()<deadline) {
++            const {monitor}=await api.execute('perf.stats',{});
++            if (monitor.frame===monitor.playheadFrame && monitor.revision===monitor.projectRevision &&
++                (frame===undefined || monitor.frame===frame)) return monitor;
++            await wait(50);
++        }
++        throw new Error('Stopped/seek frame did not become exact');
++    };
++    try {
++        await api.openProject(new win.File([JSON.stringify(project)],'Delayed.fcproj'));
++        await exact(0);
++        const forward=await samples(1), stopped=await exact();
++        await api.execute('playhead.set',{seconds:20});
++        await exact(600);
++        const reverse=await samples(-1);
++        await exact();
++        await api.execute('playhead.set',{seconds:2});
++        const seek=await exact(60);
++        check(api.frameSources().every(s=>!s.error), 'Host source error');
++        return {ok:true,capacity:64,sources:sources.length,forward,reverse,stopped,seek};
++    } finally {
++        await api.request('ui.playback',{action:'stop'});
++        await api.execute('file.newProject',{name:'Finished regression'});
++        sources.forEach(source=>api.closeFrames(source.handle));
++    }
++}

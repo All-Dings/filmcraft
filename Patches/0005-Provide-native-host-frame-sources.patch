@@ -1,0 +1,498 @@
+Subject: Provide native Host-Frame-Sources for Preview, Playback and Export
+
+Allow an embedding Launcher to supply live Video-Frames to native FilmCraft
+through the existing MediaSource-Interface. Register an optional authenticated
+Loopback-Reader, when FILMCRAFT_FRAMES_PORT and FILMCRAFT_FRAMES_TOKEN are set.
+Opaque .fcframes Descriptors identify Sources without storing End-Points or
+Credentials in Project-Files. The Host owns Source-Authorization, Persistence
+and Reconstruction when reopening a saved Project.
+
+The Reader requests Media-Descriptions and exact Media-Ticks, then receives
+straight RGBA8-Pixels. Validate Dimensions, Timing and Payload-Sizes before
+Allocation, bound Response-Headers and Request-Deadlines, and poll Cancellation
+while reading. Retry explicit Host-Back-Pressure within the same Deadline.
+Report Cancellation separately from Decode-Failures, so it does not mark a
+healthy Source as unreadable. Preview, Thumbnails and Export share this Reader.
+
+Extend coherent Playback-Scheduling to native .fcframes Sources. Let a pending
+Picture finish before catching up to the Playback-Clock, avoiding Starvation,
+when Host-Rendering takes longer than one Frame-Interval. Paused Seeks and
+Exports retain Requests for the exact Time.
+
+Include Regression-Coverage for Cancellation, Back-Pressure, exact Ticks,
+malformed Responses and Playback-Scheduling with pending Frames.
+
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1694,9 +1694,12 @@
+  "cpal",
+  "eframe",
+  "egui",
++ "filmcraft-codecs",
+  "filmcraft-engine",
+  "filmcraft-export",
++ "filmcraft-frame",
+  "filmcraft-gpu",
++ "filmcraft-media",
+  "filmcraft-platform",
+  "filmcraft-project",
+  "filmcraft-render",
+--- a/apps/filmcraft/Cargo.toml
++++ b/apps/filmcraft/Cargo.toml
+@@ -19,6 +19,9 @@
+ 
+ [dependencies]
+ filmcraft-engine = { workspace = true }
++filmcraft-codecs = { workspace = true }
++filmcraft-media = { workspace = true }
++filmcraft-frame = { workspace = true }
+ filmcraft-export = { workspace = true }
+ filmcraft-project = { workspace = true }
+ filmcraft-render = { workspace = true }
+--- /dev/null
++++ b/apps/filmcraft/src/host_frames.rs
+@@ -0,0 +1,287 @@
++//! Optional native host frames. The launcher supplies a loopback port and credential through
++//! the environment. Files contain only an opaque source id, never endpoints or credentials.
++//! The host owns preparation and persistence. FilmCraft asks for exact media ticks on demand.
++use std::io::{self, BufRead, BufReader, Read, Write};
++use std::net::{Ipv4Addr, SocketAddr, TcpStream};
++use std::sync::{Arc, OnceLock};
++use std::time::{Duration, Instant};
++
++use filmcraft_frame::{AudioBuffer, VideoFrame};
++use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource, Result, SharedReader, SharedSource};
++use serde_json::{Value, json};
++
++const MAGIC: &[u8] = b"FilmCraft Native Frames 1\n";
++const HEADER_LIMIT: u64 = 16 * 1024;
++const TIMEOUT: Duration = Duration::from_secs(30);
++static HOST: OnceLock<Host> = OnceLock::new();
++
++#[derive(Clone)]
++struct Host {
++    port: u16,
++    token: String,
++}
++
++pub fn install() {
++    let port = std::env::var("FILMCRAFT_FRAMES_PORT").ok().and_then(|v| v.parse::<u16>().ok()).filter(|p| *p > 0);
++    let token = std::env::var("FILMCRAFT_FRAMES_TOKEN").ok().filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()));
++    if let (Some(port), Some(token)) = (port, token) {
++        let _ = HOST.set(Host { port, token });
++        filmcraft_codecs::register_reader_opener(open);
++    }
++}
++
++fn error(message: impl ToString) -> MediaError {
++    MediaError::Decode(format!("native host frames: {}", message.to_string()))
++}
++
++fn io_error(cause: io::Error) -> MediaError {
++    // Playback routinely supersedes in-flight reads. Reporting them as decode failures
++    // makes the monitor count healthy sources as damaged and display an unreadable slate.
++    if filmcraft_media::cancel::cancelled() { MediaError::Cancelled } else { error(cause) }
++}
++
++// Poll cancellation even while a host renders, and bound total time rather than only inactivity.
++struct Connection {
++    stream: TcpStream,
++    deadline: Instant,
++}
++impl Read for Connection {
++    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
++        loop {
++            if filmcraft_media::cancel::cancelled() {
++                return Err(io::Error::other("cancelled"));
++            }
++            if Instant::now() >= self.deadline {
++                return Err(io::Error::new(io::ErrorKind::TimedOut, "host frame timeout"));
++            }
++            match self.stream.read(buffer) {
++                Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => continue,
++                result => return result,
++            }
++        }
++    }
++}
++impl Host {
++    fn request(&self, source: &str, time: Option<i64>) -> Result<(Value, BufReader<Connection>)> {
++        let deadline = Instant::now() + TIMEOUT;
++        let request = match time {
++            Some(t) => json!({"token": self.token, "source": source, "method": "frame", "time": t.to_string()}),
++            None => json!({"token": self.token, "source": source, "method": "describe"}),
++        };
++        loop {
++            if filmcraft_media::cancel::cancelled() {
++                return Err(MediaError::Cancelled);
++            }
++            if Instant::now() >= deadline {
++                return Err(error("host frame timeout"));
++            }
++            let address = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
++            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).map_err(io_error)?;
++            stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(io_error)?;
++            stream.set_read_timeout(Some(Duration::from_millis(200))).map_err(io_error)?;
++            writeln!(stream, "{request}").map_err(io_error)?;
++            let mut reader = BufReader::new(Connection { stream, deadline });
++            let mut header = Vec::new();
++            reader.by_ref().take(HEADER_LIMIT + 1).read_until(b'\n', &mut header).map_err(io_error)?;
++            if filmcraft_media::cancel::cancelled() {
++                return Err(MediaError::Cancelled);
++            }
++            if header.len() as u64 > HEADER_LIMIT || header.last() != Some(&b'\n') {
++                return Err(error("invalid response header"));
++            }
++            let response: Value = serde_json::from_slice(&header).map_err(error)?;
++            if response["ok"] != true {
++                if response["busy"] == true {
++                    // A full host queue is not damaged media. Retry within the original
++                    // deadline, yielding promptly when playback supersedes this request.
++                    drop(reader);
++                    std::thread::sleep(Duration::from_millis(50));
++                    continue;
++                }
++                return Err(error(response["error"].as_str().unwrap_or("host unavailable")));
++            }
++            return Ok((response, reader));
++        }
++    }
++
++    fn source(&self, id: &str) -> Result<Source> {
++        let (response, _) = self.request(id, None)?;
++        let info: MediaInfo = serde_json::from_value(response["info"].clone()).map_err(error)?;
++        let v = info.video.as_ref().ok_or_else(|| error("video stream required"))?;
++        if !(1..=8192).contains(&v.width)
++            || !(1..=8192).contains(&v.height)
++            || u64::from(v.width) * u64::from(v.height) > 33_554_432
++            || !(1..=9_007_199_254_740_991).contains(&info.duration.0)
++            || !info.audio_streams.is_empty()
++            || !(1..=120_000).contains(&v.frame_rate.num)
++            || !(1..=10_000).contains(&v.frame_rate.den)
++            || v.par != (1, 1)
++            || v.pixel_format != "rgba8"
++        {
++            return Err(error("invalid source description"));
++        }
++        Ok(Source { host: self.clone(), id: id.into(), info })
++    }
++}
++
++fn open(_name: &str, head: &[u8], reader: &SharedReader) -> Option<Result<SharedSource>> {
++    let id = head.strip_prefix(MAGIC)?;
++    Some((|| {
++        if reader.len() != (MAGIC.len() + 32) as u64 || id.len() != 32 || !id.iter().all(u8::is_ascii_hexdigit) {
++            return Err(error("invalid source descriptor"));
++        }
++        let host = HOST.get().ok_or_else(|| error("no embedding host"))?;
++        let source = host.source(std::str::from_utf8(id).map_err(error)?)?;
++        Ok(Arc::new(source) as SharedSource)
++    })())
++}
++
++struct Source {
++    host: Host,
++    id: String,
++    info: MediaInfo,
++}
++impl MediaSource for Source {
++    fn info(&self) -> &MediaInfo {
++        &self.info
++    }
++
++    fn video_frame(&self, request: FrameRequest) -> Result<Arc<VideoFrame>> {
++        if request.time.0 < 0 || request.time >= self.info.duration {
++            return Err(error("frame outside source interval"));
++        }
++        let v = self.info.video.as_ref().ok_or_else(|| error("missing video stream"))?;
++        let size = u64::from(v.width) * u64::from(v.height) * 4;
++        let (header, mut reader) = self.host.request(&self.id, Some(request.time.0))?;
++        if header["bytes"].as_u64() != Some(size) || header["time"].as_str() != Some(&request.time.0.to_string()) {
++            return Err(error("incorrect frame time or byte count"));
++        }
++        let mut pixels = vec![0; size as usize];
++        reader.read_exact(&mut pixels).map_err(io_error)?;
++        if filmcraft_media::cancel::cancelled() {
++            return Err(MediaError::Cancelled);
++        }
++        Ok(Arc::new(VideoFrame::rgba8(v.width, v.height, pixels).with_pts(request.time)))
++    }
++
++    fn audio(&self, _start: i64, _frames: usize, _rate: u32) -> Result<AudioBuffer> {
++        Err(MediaError::NoStream("audio"))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use filmcraft_time::Tick;
++    use std::net::TcpListener;
++    use std::sync::atomic::{AtomicBool, Ordering};
++
++    #[test]
++    fn cancelled_header_and_pixel_reads_are_retryable() {
++        for partial in [b"{".to_vec(), b"{\"ok\":true,\"time\":\"37\",\"bytes\":8}\n\0\0\0\0".to_vec()] {
++            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++            let host = Host { port: listener.local_addr().unwrap().port(), token: "a".repeat(64) };
++            let source = Source { host, id: "test-source".into(), info: serde_json::from_value(info()).unwrap() };
++            let flag = Arc::new(AtomicBool::new(false));
++            let cancel = flag.clone();
++            let (release, wait) = std::sync::mpsc::channel();
++            let worker = std::thread::spawn(move || {
++                let (mut stream, _) = listener.accept().unwrap();
++                let mut line = String::new();
++                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
++                stream.write_all(&partial).unwrap();
++                cancel.store(true, Ordering::Relaxed);
++                // Leave the response incomplete until the caller notices cancellation.
++                wait.recv_timeout(Duration::from_secs(3)).unwrap();
++                drop(stream);
++                let (mut retry, _) = listener.accept().unwrap();
++                BufReader::new(retry.try_clone().unwrap()).read_line(&mut String::new()).unwrap();
++                retry.write_all(b"{\"ok\":true,\"time\":\"37\",\"bytes\":8}\n").unwrap();
++                retry.write_all(&[255; 8]).unwrap();
++            });
++            let result = filmcraft_media::cancel::with_cancel(&flag, || source.video_frame(FrameRequest::full(Tick(37))));
++            release.send(()).unwrap();
++            let retry = source.video_frame(FrameRequest::full(Tick(37))).unwrap();
++            worker.join().unwrap();
++            assert!(matches!(result, Err(MediaError::Cancelled)), "expected cancellation, got {result:?}");
++            assert_eq!(retry.pts, Tick(37));
++        }
++    }
++
++    fn info() -> Value {
++        json!({"name":"test", "kind":"Movie", "duration":100,
++            "video":{"width":2,"height":1,"frame_rate":{"num":30,"den":1},"par":[1,1],
++                "codec":"host-rgba","pixel_format":"rgba8","color":{"matrix":"Bt709","transfer":"Srgb","primaries":"Bt709","range":"Full"},"has_alpha":true,"bitrate":null},
++            "audio_streams":[],"container":"host-frames","start_timecode":null,"file_size":null})
++    }
++
++    fn host(replies: Vec<(Value, Vec<u8>)>) -> (Host, std::thread::JoinHandle<Vec<Value>>) {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let worker = std::thread::spawn(move || {
++            let mut requests = Vec::new();
++            for (header, pixels) in replies {
++                let (mut stream, _) = listener.accept().unwrap();
++                let mut line = String::new();
++                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
++                requests.push(serde_json::from_str(&line).unwrap());
++                writeln!(stream, "{header}").unwrap();
++                stream.write_all(&pixels).unwrap();
++            }
++            requests
++        });
++        (Host { port, token: "a".repeat(64) }, worker)
++    }
++
++    #[test]
++    fn exact_ticks_rgba_and_bounds() {
++        let (host, worker) =
++            host(vec![(json!({"ok":true,"info":info()}), vec![]), (json!({"ok":true,"time":"37","bytes":8}), vec![255, 0, 0, 255, 0, 255, 0, 128])]);
++        let source = host.source("test-source").unwrap();
++        let frame = source.video_frame(FrameRequest::full(Tick(37))).unwrap();
++        assert_eq!((frame.width, frame.height, frame.pts), (2, 1, Tick(37)));
++        let filmcraft_frame::PixelData::Rgba8(pixels) = &frame.data else { panic!("wrong pixel format") };
++        assert_eq!(pixels.as_slice(), [255, 0, 0, 255, 0, 255, 0, 128]);
++        assert!(source.video_frame(FrameRequest::full(Tick(100))).is_err());
++        assert!(source.video_frame(FrameRequest::full(Tick(-1))).is_err());
++        let requests = worker.join().unwrap();
++        assert_eq!(requests[1]["time"], "37");
++        assert_eq!(requests[0]["token"], "a".repeat(64));
++    }
++
++    #[test]
++    fn temporary_backpressure_retries_the_same_frame() {
++        let (host, worker) = host(vec![(json!({"ok":false,"busy":true}), vec![]), (json!({"ok":true,"time":"37","bytes":8}), vec![255; 8])]);
++        let source = Source { host, id: "test-source".into(), info: serde_json::from_value(info()).unwrap() };
++        let frame = source.video_frame(FrameRequest::full(Tick(37))).unwrap();
++        let requests = worker.join().unwrap();
++        assert_eq!(frame.pts, Tick(37));
++        assert_eq!(requests.len(), 2);
++        assert_eq!(requests[0], requests[1]);
++    }
++
++    #[test]
++    fn refuses_wrong_time_wrong_size_truncated_pixels_and_host_errors() {
++        for (header, pixels) in [
++            (json!({"ok":true,"time":"38","bytes":8}), vec![]),
++            (json!({"ok":true,"time":"37","bytes":900000000}), vec![]),
++            (json!({"ok":true,"time":"37","bytes":8}), vec![0; 7]),
++            (json!({"ok":false,"error":"source changed"}), vec![]),
++        ] {
++            let (host, worker) = host(vec![(json!({"ok":true,"info":info()}), vec![]), (header, pixels)]);
++            assert!(host.source("x").unwrap().video_frame(FrameRequest::full(Tick(37))).is_err());
++            worker.join().unwrap();
++        }
++    }
++
++    #[test]
++    fn invalid_description_and_cancellation_fail_before_pixel_allocation() {
++        let mut invalid = info();
++        invalid["video"]["width"] = json!(9000);
++        let (host, worker) = host(vec![(json!({"ok":true,"info":invalid}), vec![])]);
++        assert!(host.source("x").is_err());
++        worker.join().unwrap();
++        let flag = Arc::new(AtomicBool::new(true));
++        assert!(matches!(filmcraft_media::cancel::with_cancel(&flag, || host.source("x")), Err(MediaError::Cancelled)));
++    }
++}
+--- a/apps/filmcraft/src/main.rs
++++ b/apps/filmcraft/src/main.rs
+@@ -33,6 +33,7 @@
+ mod dev_icon;
+ mod file_filters;
+ mod graphics;
++mod host_frames;
+ mod logging;
+ #[cfg(target_os = "macos")]
+ mod native_menu;
+@@ -121,6 +122,7 @@
+     // OS hardware video decoders (VideoToolbox on macOS) in front of our own; Settings ▸ Playback ▸
+     // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
+     register_hardware_decoders();
++    host_frames::install();
+     // Which graphics backends and adapter the window starts with: `--graphics`, else the saved
+     // mode, which moves on after starts that died before their window painted (a driver crash),
+     // see graphics.rs.
+--- a/docs/all-dings-addons.md
++++ b/docs/all-dings-addons.md
+@@ -72,3 +72,42 @@
+ source provenance. Cancelled and still-loading jobs never publish a trace.
+ ArtCraft uses this read-only information only on explicit user request to copy
+ a paused, current picture's source positions back into its Channel builder.
++
++## Native temporal frames supplied by a launcher
++
++The native executable registers an optional generic media reader when
++`FILMCRAFT_FRAMES_PORT` and `FILMCRAFT_FRAMES_TOKEN` are set. The port must be
++nonzero and the token must contain 64 hexadecimal characters. The destination
++is always IPv4 loopback. A source file contains exactly
++`FilmCraft Native Frames 1\n` followed by a 32-character hexadecimal source id.
++Files and saved projects contain neither the port nor the token.
++
++Each TCP connection carries one JSON line:
++`{"token":"…","source":"…","method":"describe"}` returns
++`{"ok":true,"info":MediaInfo}`. The description must specify RGBA8, square
++pixels, no audio, positive duration up to the largest safe JSON integer, at most
++8192 pixels per side and 33,554,432 total pixels. Frame-rate numerator/denominator
++are bounded to 120000/10000.
++
++`{"token":"…","source":"…","method":"frame","time":"<ticks>"}` returns
++`{"ok":true,"time":"<same ticks>","bytes":<width*height*4>}` and then exactly
++that many raw straight RGBA8 bytes. Time is in FilmCraft media ticks, in
++`[0,duration)`. Errors use `{"ok":false,"error":"…"}`. Reply headers are limited
++to 16 KiB, connections to two seconds and responses to thirty seconds.
++Hosts with a full request queue reply `{"ok":false,"busy":true}`. The reader
++retries after 50 ms within the original deadline; other errors are not retried.
++Reads poll the existing cancellation token and preserve cancellation during both
++header and pixel reads as `MediaError::Cancelled`. Superseded playback requests
++therefore do not count as damaged media; the next request can retry normally.
++Bad times, lengths and descriptions
++fail before pixel allocation. Preview, thumbnails and export use the existing
++native media interface and caches.
++Playback of projects containing `.fcframes` sources finishes one coherent
++picture before catching up to the clock. This avoids starving a slow host by
++continually cancelling its current render. Paused seeks and exports still ask
++for the exact requested time.
++
++The host owns source identity, authorization, persistence and re-registration.
++Reopening a project in another launch requires its host to reconstruct the
++sources and replace the temporary file paths before opening it in FilmCraft.
++The native reader has no application-specific recipe or reference schema.
+--- a/crates/ui-egui/src/frames.rs
++++ b/crates/ui-egui/src/frames.rs
+@@ -73,6 +73,17 @@
+     a.target == b.target && a.size == b.size && a.revision == b.revision && a.draft == b.draft
+ }
+ 
++/// Host-produced pictures may take longer than a display interval. Finish a coherent
++/// picture before catching up, as for asynchronous browser sources.
++pub fn coherent_playback(project: &Project) -> bool {
++    cfg!(target_arch = "wasm32")
++        || project.items.values().any(|item| {
++            matches!(&item.kind, filmcraft_project::ItemKind::Media(media)
++                if matches!(&media.media, filmcraft_project::MediaRef::File { path }
++                    if std::path::Path::new(path).extension().is_some_and(|ext| ext == "fcframes")))
++        })
++}
++
+ /// Whether a monitor frame is requested with draft decoding ([`FrameKey::draft`]): only while
+ /// playing, at 1/2 resolution or lower, with the preference on.
+ pub fn draft_playback(playing: bool, scale: f32, enabled: bool) -> bool {
+@@ -678,13 +689,24 @@
+     /// not be ready in time are not started and the workers get evenly spaced frames they can
+     /// finish ([`playback_plan`]). While `preroll` (clock not started yet) every frame is wanted.
+     pub fn schedule_playback(&self, key: FrameKey, rate: filmcraft_time::FrameRate, scale: f32, project: &Arc<Project>, speed: f64, preroll: bool) {
+-        if cfg!(target_arch = "wasm32") {
++        if coherent_playback(project) {
+             // Async sources return Pending to pump(), then complete on a later
+             // browser turn. Replacing that job every clock tick starves the
+             // composite forever. Finish one coherent picture, then catch up.
+             let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+-            let pending = q.iter().find(|j| j.prio == 0 && same_view(j.key, key)).map(|j| j.key);
++            let running = self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner());
++            let pending = running
++                .iter()
++                .find(|(k, cancel, _)| same_view(*k, key) && !cancel.load(Ordering::Relaxed))
++                .map(|(k, _, _)| *k)
++                .or_else(|| q.iter().find(|j| j.prio == 0 && same_view(j.key, key)).map(|j| j.key));
+             q.retain(|j| j.key.target != key.target || Some(j.key) == pending);
++            for (k, cancel, _) in running.iter() {
++                if k.target == key.target && !same_view(*k, key) {
++                    cancel.store(true, Ordering::Relaxed);
++                }
++            }
++            drop(running);
+             drop(q);
+             if pending.is_none() {
+                 let next = if preroll {
+@@ -1121,6 +1143,35 @@
+     use filmcraft_project::ItemId;
+ 
+     #[test]
++    fn host_playback_finishes_in_flight_picture_and_cancels_on_stop_or_revision() {
++        use super::*;
++        let mut session = filmcraft_engine::Session::default();
++        session.execute("file.openDemoProject", serde_json::json!({})).unwrap();
++        assert!(!coherent_playback(&session.project));
++        let project = Arc::make_mut(&mut session.project);
++        let media = project.items.values_mut().find_map(|item| item.as_media_mut()).unwrap();
++        media.media = filmcraft_project::MediaRef::File { path: "/test/source.fcframes".into() };
++        let server = FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), 1);
++        let key = FrameKey { target: Target::Sequence(ItemId(1)), frame: 0, size: 500, revision: 1, draft: false };
++        let cancel = Arc::new(AtomicBool::new(false));
++        server.shared.in_flight.lock().unwrap().push((key, cancel.clone(), true));
++        let rate = filmcraft_time::FrameRate::new(30, 1);
++        for frame in 1..100 {
++            server.schedule_playback(FrameKey { frame, ..key }, rate, 0.5, &session.project, 1.0, false);
++        }
++        assert!(!cancel.load(Ordering::Relaxed), "a slow host must finish its current picture");
++        assert_eq!(server.queue_len(), 0, "do not queue a render for every clock tick");
++        let newer = FrameKey { revision: 2, frame: 100, ..key };
++        let next_cancel = Arc::new(AtomicBool::new(false));
++        server.shared.in_flight.lock().unwrap().push((newer, next_cancel.clone(), true));
++        server.schedule_playback(newer, rate, 0.5, &session.project, 1.0, false);
++        assert!(cancel.load(Ordering::Relaxed));
++        assert!(!next_cancel.load(Ordering::Relaxed));
++        server.stop_prefetch();
++        assert!(next_cancel.load(Ordering::Relaxed));
++    }
++
++    #[test]
+     fn source_reads_keep_distinct_times_and_bound_work() {
+         let mut trace = super::SourceReads::default();
+         trace.record(ItemId(1), filmcraft_time::Tick(3));
+--- a/crates/ui-egui/src/panels/monitor.rs
++++ b/crates/ui-egui/src/panels/monitor.rs
+@@ -217,7 +217,7 @@
+             app.frames.request(key, rate.tick_of(frame), scale, &project, 0);
+         }
+         let mut asked = asked_before(app, prefix, key, playing);
+-        if cfg!(target_arch = "wasm32") && playing {
++        if crate::frames::coherent_playback(&project) && playing {
+             let speed = if which == Which::Program { app.playback.speed } else { app.source_playback.clock.speed };
+             if let Some(ready) = app.frames.async_playback_picture(key, speed) {
+                 asked.push(ready);

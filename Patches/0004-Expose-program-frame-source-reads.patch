@@ -1,0 +1,243 @@
+Index: filmcraft/crates/ui-egui/src/frames.rs
+===================================================================
+--- filmcraft.orig/crates/ui-egui/src/frames.rs	2026-11-04 05:41:03.947994772 +0100
++++ filmcraft/crates/ui-egui/src/frames.rs	2026-11-04 21:18:00.817637994 +0100
+@@ -7,7 +7,7 @@
+ //! Sequence frames inside a rendered segment come from its render preview instead of the live
+ //! render (see `filmcraft_engine::previews`).
+ 
+-use std::cell::Cell;
++use std::cell::{Cell, RefCell};
+ use std::collections::{HashMap, VecDeque};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Condvar, Mutex};
+@@ -153,6 +153,7 @@
+ }
+ 
+ struct Shared {
++    source_reads: Mutex<VecDeque<(FrameKey, SourceReads)>>,
+     queue: Mutex<VecDeque<Job>>,
+     cv: Condvar,
+     done: Mutex<Cache>,
+@@ -275,6 +276,7 @@
+ }
+ 
+ thread_local! {
++    static SOURCE_READS: RefCell<SourceReads> = RefCell::new(SourceReads::default());
+     /// (wall, cpu) spent in source `video_frame` calls by this worker during the current job.
+     static SOURCE_TIME: Cell<(Duration, Duration)> = const { Cell::new((Duration::ZERO, Duration::ZERO)) };
+     /// This worker is profiling the current job (thread CPU of source calls is measured).
+@@ -295,13 +297,49 @@
+ }
+ 
+ /// A media source that times its `video_frame` calls (see [`JobRecord::source_wall`]).
+-struct TimedSource(filmcraft_media::SharedSource);
++struct TimedSource(filmcraft_media::SharedSource, ItemId);
++
++/// The actual media demands of one completed frame, including hits in source caches.
++#[derive(Clone, Debug, Default)]
++pub struct SourceReads {
++    pub reads: Vec<(ItemId, Tick)>,
++    pub truncated: bool,
++    pub preview: bool,
++}
++
++impl SourceReads {
++    fn record(&mut self, item: ItemId, time: Tick) {
++        if self.reads.contains(&(item, time)) {
++            return;
++        }
++        if self.reads.len() >= 256 {
++            self.truncated = true;
++            return;
++        }
++        self.reads.push((item, time));
++    }
++}
++
++fn remember_source_reads(sh: &Shared, key: FrameKey, preview: bool) {
++    if !matches!(key.target, Target::Sequence(_) | Target::SequencePlan(_) | Target::SequenceLive(_)) {
++        return;
++    }
++    let mut reads = SOURCE_READS.with(|s| s.borrow().clone());
++    reads.preview = preview;
++    let mut cache = sh.source_reads.lock().unwrap_or_else(|e| e.into_inner());
++    cache.retain(|(k, _)| *k != key);
++    if cache.len() >= 256 {
++        cache.pop_front();
++    }
++    cache.push_back((key, reads));
++}
+ 
+ impl filmcraft_media::MediaSource for TimedSource {
+     fn info(&self) -> &filmcraft_media::MediaInfo {
+         self.0.info()
+     }
+     fn video_frame(&self, req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
++        SOURCE_READS.with(|s| s.borrow_mut().record(self.1, req.time));
+         timed_source(|| self.0.video_frame(req))
+     }
+     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+@@ -321,7 +359,7 @@
+ impl filmcraft_render::SourceProvider for JobProvider {
+     fn source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
+         let s = self.inner.pool.monitor_source(item, self.inner.source(item)?);
+-        Some(Arc::new(TimedSource(s)))
++        Some(Arc::new(TimedSource(s, item)))
+     }
+ }
+ 
+@@ -469,6 +507,7 @@
+ 
+     pub fn new(pool: Arc<MediaPool>, services: Arc<dyn Services>, previews: Arc<PreviewStore>, workers: usize) -> Self {
+         let shared = Arc::new(Shared {
++            source_reads: Mutex::new(VecDeque::new()),
+             queue: Mutex::new(VecDeque::new()),
+             cv: Condvar::new(),
+             done: Mutex::new(Cache { map: HashMap::new(), bytes: 0, budget: 768 << 20, clock: 0 }),
+@@ -500,6 +539,11 @@
+         std::thread::available_parallelism().map(|n| n.get().clamp(2, 6)).unwrap_or(3)
+     }
+ 
++    /// None means the trace has expired; callers must not guess from newer requests.
++    pub fn source_reads(&self, key: FrameKey) -> Option<SourceReads> {
++        self.shared.source_reads.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|(_, r)| r.clone())
++    }
++
+     pub fn set_context(&self, ctx: &egui::Context) {
+         let mut g = self.repaint.lock().unwrap_or_else(|e| e.into_inner());
+         if g.is_none() {
+@@ -911,6 +955,7 @@
+     let profiling = sh.profiling.load(Ordering::Relaxed);
+     let (started, cpu0) = (Instant::now(), if profiling { thread_cpu_time().unwrap_or_default() } else { Duration::ZERO });
+     SOURCE_TIME.with(|s| s.set((Duration::ZERO, Duration::ZERO)));
++    SOURCE_READS.with(|s| *s.borrow_mut() = SourceReads::default());
+     PROFILING.with(|p| p.set(profiling));
+     // A cancelled job may have missed layers (its source gave up): its result is not cached.
+     // A job whose media bytes were still loading (web) rendered with missing layers: like a
+@@ -927,6 +972,7 @@
+                         if !job.cancel.load(Ordering::Relaxed) && !loading {
+                             // Convert texels for upload here, not on the UI thread when the frame is shown.
+                             let prepared = filmcraft_gpu::prepare(&plan);
++                            remember_source_reads(sh, job.key, pv);
+                             sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+                         }
+                         pv
+@@ -934,6 +980,7 @@
+                         let (img, pv) = render_job(job, pool, services, previews);
+                         loading = filmcraft_media::pending::take();
+                         if !job.cancel.load(Ordering::Relaxed) && !loading {
++                            remember_source_reads(sh, job.key, pv);
+                             sh.done.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, Arc::new(img));
+                         }
+                         pv
+@@ -1074,6 +1121,20 @@
+     use filmcraft_project::ItemId;
+ 
+     #[test]
++    fn source_reads_keep_distinct_times_and_bound_work() {
++        let mut trace = super::SourceReads::default();
++        trace.record(ItemId(1), filmcraft_time::Tick(3));
++        trace.record(ItemId(1), filmcraft_time::Tick(3));
++        trace.record(ItemId(1), filmcraft_time::Tick(4));
++        assert_eq!(trace.reads.len(), 2);
++        for time in 0..300 {
++            trace.record(ItemId(2), filmcraft_time::Tick(time));
++        }
++        assert_eq!(trace.reads.len(), 256);
++        assert!(trace.truncated);
++    }
++
++    #[test]
+     fn only_item_thumbnails_are_background_work() {
+         let item = Target::Item(ItemId(1));
+         // thumbnails (50) and the Media Browser (40)
+Index: filmcraft/crates/ui-egui/src/perf.rs
+===================================================================
+--- filmcraft.orig/crates/ui-egui/src/perf.rs	2026-10-18 23:17:15.300703807 +0200
++++ filmcraft/crates/ui-egui/src/perf.rs	2026-11-04 21:28:28.019758171 +0100
+@@ -46,6 +46,33 @@
+         "projectRevision": app.session.revision,
+         "playheadFrame": app.session.active_sequence().map(|q| q.settings.frame_rate.frame_at(app.session.playhead())),
+     });
++    // Bind provenance to the picture actually shown, never to the last decoder request.
++    if let Some(key) = app.program_picture()
++        && key.revision == app.session.revision
++        && let crate::frames::Target::Sequence(seq) | crate::frames::Target::SequencePlan(seq) | crate::frames::Target::SequenceLive(seq) = key.target
++        && app.session.state.active_sequence == Some(seq)
++        && let Some(q) = app.session.project.sequence(seq)
++    {
++        v["monitor"]["sequence"] = json!(seq);
++        v["monitor"]["timeTicks"] = json!(q.settings.frame_rate.tick_of(key.frame).0.to_string());
++        if let Some(trace) = app.frames.source_reads(key) {
++            v["monitor"]["sourceReadsTruncated"] = json!(trace.truncated);
++            v["monitor"]["renderPreview"] = json!(trace.preview);
++            v["monitor"]["sourceReads"] = json!(
++                trace
++                    .reads
++                    .iter()
++                    .map(|(item, time)| {
++                        let path = app.session.project.resolve_media(*item).and_then(|(_, media, _)| match &media.media {
++                            filmcraft_project::MediaRef::File { path } => Some(path.as_str()),
++                            _ => None,
++                        });
++                        json!({"item": item, "path": path, "timeTicks": time.0.to_string()})
++                    })
++                    .collect::<Vec<_>>()
++            );
++        }
++    }
+     v["ui"] = json!({"fps": app.fps, "frameMs": if app.fps > 0.0 { 1000.0 / app.fps as f64 } else { 0.0 }});
+     v["process"] = json!({"cpuS": crate::frames::process_cpu_time().map(|d| d.as_secs_f64())});
+     v
+Index: filmcraft/docs/all-dings-addons.md
+===================================================================
+--- filmcraft.orig/docs/all-dings-addons.md	2026-11-04 19:00:17.087402634 +0100
++++ filmcraft/docs/all-dings-addons.md	2026-11-04 21:17:43.790317873 +0100
+@@ -60,3 +60,15 @@
+ All-Dings keeps Channel graphs, RCZ decoding, canonical measurement time and
+ PNG decoding in its adapter. FilmCraft only sees its ordinary media interface;
+ its project schema, timeline and compositor are unchanged.
++
++## Program-picture source provenance
++
++`perf.stats.monitor` additionally reports `sequence`, exact `timeTicks` (string),
++and `sourceReads` (`item`, file `path`, exact `timeTicks`) for the displayed
++Program picture. Completed frame jobs retain their actual media demands,
++including source-cache hits. The trace is bounded to 256 distinct demands and
++256 pictures; an absent trace or `sourceReadsTruncated` must not be treated as a
++complete snapshot. `renderPreview` indicates a flattened preview without live
++source provenance. Cancelled and still-loading jobs never publish a trace.
++ArtCraft uses this read-only information only on explicit user request to copy
++a paused, current picture's source positions back into its Channel builder.
+Index: filmcraft/crates/ui-egui/tests/it/perf_ui.rs
+===================================================================
+--- filmcraft.orig/crates/ui-egui/tests/it/perf_ui.rs	2026-10-26 02:05:50.569109126 +0100
++++ filmcraft/crates/ui-egui/tests/it/perf_ui.rs	2026-11-04 21:25:12.609012302 +0100
+@@ -90,6 +90,26 @@
+ }
+ 
+ #[test]
++fn program_source_reads_follow_the_picture_and_survive_cache_hits() {
++    let mut d = Driver::demo();
++    d.settled();
++    let first = d.ok("perf.stats", json!({}))["monitor"].clone();
++    assert!(!first["sourceReads"].as_array().unwrap().is_empty(), "{first}");
++    assert_eq!(first["sourceReadsTruncated"], json!(false));
++    assert_eq!(first["renderPreview"], json!(false));
++    d.exec("playhead.set", json!({"frame": 30}));
++    d.settled();
++    let second = d.ok("perf.stats", json!({}))["monitor"].clone();
++    assert_ne!(first["timeTicks"], second["timeTicks"]);
++    assert_ne!(first["sourceReads"], second["sourceReads"]);
++    d.exec("playhead.set", json!({"frame": first["frame"]}));
++    d.settled();
++    let cached = d.ok("perf.stats", json!({}))["monitor"].clone();
++    assert_eq!(first["sourceReads"], cached["sourceReads"]);
++    assert_eq!(first["timeTicks"], cached["timeTicks"]);
++}
++
++#[test]
+ fn perf_stats_reports_playback_frames_and_decode() {
+     let mut d = Driver::demo();
+     // let the Program monitor render a few frames on the workers
